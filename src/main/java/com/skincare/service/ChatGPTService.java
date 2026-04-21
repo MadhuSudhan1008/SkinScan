@@ -1,8 +1,6 @@
 package com.skincare.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.skincare.dto.ChatGPTRequest;
-import com.skincare.dto.ChatGPTResponse;
 import com.skincare.dto.IngredientAnalysisResult;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -10,12 +8,14 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 import org.springframework.web.reactive.function.client.WebClient;
- 
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
- 
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -41,70 +41,149 @@ public class ChatGPTService {
         try {
             String normalizedIngredients = normalizeAndTrimIngredients(ingredientsText, 150, 8000);
             String prompt = buildPrompt(normalizedIngredients);
-            
-            ChatGPTRequest request = new ChatGPTRequest();
-            request.setModel(chatGPTModel);
-            request.setMessages(Arrays.asList(
-                new ChatGPTRequest.Message("system", "You are an expert in cosmetic and skincare formulation analysis."),
-                new ChatGPTRequest.Message("user", prompt)
+
+            Map<String, Object> request = new LinkedHashMap<>();
+            request.put("model", chatGPTModel);
+            request.put("input", List.of(
+                    Map.of(
+                            "role", "system",
+                            "content", List.of(
+                                    Map.of(
+                                            "type", "input_text",
+                                            "text", "You are an expert in cosmetic and skincare formulation analysis."
+                                    )
+                            )
+                    ),
+                    Map.of(
+                            "role", "user",
+                            "content", List.of(
+                                    Map.of(
+                                            "type", "input_text",
+                                            "text", prompt
+                                    )
+                            )
+                    )
             ));
-            request.setTemperature(chatGPTTemperature);
-            request.setMax_tokens(2000);
+            request.put("max_output_tokens", 2000);
+
+            if (isGpt5Model(chatGPTModel)) {
+                request.put("reasoning", Map.of("effort", "none"));
+            } else {
+                request.put("temperature", chatGPTTemperature);
+            }
 
             WebClient webClient = webClientBuilder
-                .baseUrl(chatGPTApiUrl)
-                .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + chatGPTApiKey)
-                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
-                .build();
+                    .baseUrl(chatGPTApiUrl)
+                    .defaultHeader(HttpHeaders.AUTHORIZATION, "Bearer " + chatGPTApiKey)
+                    .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                    .build();
 
-            ChatGPTResponse response = webClient.post()
-                .bodyValue(request)
-                .retrieve()
-                .bodyToMono(ChatGPTResponse.class)
-                .block();
+            @SuppressWarnings("unchecked")
+            Map<String, Object> response = webClient.post()
+                    .bodyValue(request)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
 
-            if (response != null && response.getChoices() != null && !response.getChoices().isEmpty()) {
-                String content = response.getChoices().get(0).getMessage().getContent();
+            String content = extractTextFromResponse(response);
+            if (StringUtils.hasText(content)) {
                 log.info("ChatGPT Response: {}", content);
 
                 String cleaned = extractJsonObject(content);
                 return objectMapper.readValue(cleaned, IngredientAnalysisResult.class);
             } else {
-                log.error("No response received from ChatGPT API");
+                log.error("No valid response received from OpenAI API");
                 return createFallbackAnalysis(ingredientsText);
             }
 
+        } catch (WebClientResponseException e) {
+            log.error("OpenAI API returned {} with body: {}", e.getStatusCode(), e.getResponseBodyAsString(), e);
+            return createFallbackAnalysis(ingredientsText);
         } catch (Exception e) {
-            log.error("Error calling ChatGPT API: {}", e.getMessage(), e);
+            log.error("Error calling OpenAI API: {}", e.getMessage(), e);
             return createFallbackAnalysis(ingredientsText);
         }
     }
 
-    private String buildPrompt(String ingredientsText) {
-        return String.format("""
-            You are an expert in cosmetic and skincare formulation analysis. 
-            I will provide you a list of skincare ingredients.
-            For each ingredient, classify it as one of:
-            - "Good" (beneficial for skin)
-            - "Bad" (harmful, irritating, or unsafe)
-            - "Neutral" (no major effect, commonly used)
+    private boolean isGpt5Model(String model) {
+        return StringUtils.hasText(model) && model.toLowerCase().startsWith("gpt-5");
+    }
 
-            Then, provide a rating for the overall product on a scale of 1–10, 
-            based on the balance of good vs bad ingredients.  
+    private String extractTextFromResponse(Map<String, Object> response) {
+        if (response == null) {
+            return null;
+        }
 
-            Return the result strictly as a raw JSON object ONLY (no code fences, no markdown, no commentary), with the following structure:
-            {
-              "ingredients": [
-                { "name": "Ingredient1", "classification": "Good", "reason": "Why it is good" },
-                { "name": "Ingredient2", "classification": "Bad", "reason": "Why it is bad" }
-              ],
-              "overall_rating": 7,
-              "summary": "Short summary about the product safety and effectiveness"
+        Object outputText = response.get("output_text");
+        if (outputText instanceof String outputTextValue && StringUtils.hasText(outputTextValue)) {
+            return outputTextValue;
+        }
+
+        Object outputObject = response.get("output");
+        if (!(outputObject instanceof List<?> outputList)) {
+            return null;
+        }
+
+        for (Object item : outputList) {
+            if (!(item instanceof Map<?, ?> outputItem)) {
+                continue;
             }
 
-            If there are more than 150 ingredients, analyze the first 150 and summarize the rest.
+            Object contentObject = outputItem.get("content");
+            if (!(contentObject instanceof List<?> contentList)) {
+                continue;
+            }
 
-            Here are the ingredients to analyze: %s
+            for (Object content : contentList) {
+                if (!(content instanceof Map<?, ?> contentItem)) {
+                    continue;
+                }
+
+                Object text = contentItem.get("text");
+                if (text instanceof String textValue && StringUtils.hasText(textValue)) {
+                    return textValue;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private String buildPrompt(String ingredientsText) {
+        return String.format("""
+                You are an expert cosmetic chemist and dermatologist.
+                       \s
+                        Analyze the following skincare product ingredients for a user with skin type/concerns: %s
+                       \s
+                        Classify each ingredient as:
+                        - "Good": clinically backed benefits (e.g., hyaluronic acid, niacinamide, ceramides, peptides, retinoids, AHAs/BHAs)
+                        - "Bad": known irritants, sensitizers, or harmful compounds (e.g., denatured alcohol, artificial fragrance/parfum, formaldehyde releasers, high-risk parabens)
+                        - "Neutral": functional ingredients with no notable benefit or harm (e.g., emulsifiers, thickeners, pH adjusters)
+                       \s
+                        Important rules:
+                        - Ingredients appear in descending concentration order; weigh early ingredients more heavily
+                        - A single harmful ingredient (carcinogen, known sensitizer) should significantly impact the overall_rating
+                        - Factor in the user's skin type when classifying borderline ingredients
+                        - If more than 150 ingredients, analyze first 150 and note the count skipped
+                        - Do not guess
+                            - If evidence is weak → mark as "uncertain"
+                            - Follow dermatological consensus (INCI + scientific studies)
+                            - Be conservative for sensitive/acne-prone skin
+                       \s
+                        Return ONLY a raw JSON object, no markdown, no code fences:
+                        {
+                          "ingredients": [
+                            { "name": "Ingredient1", "classification": "Good", "reason": "Brief reason" }
+                          ],
+                          "overall_rating": 7,
+                          "rating_breakdown": {
+                            "good_count": 5,
+                            "bad_count": 2,
+                            "neutral_count": 8
+                          },
+                          "summary": "Short summary about safety and effectiveness for this skin type"
+                        }
+                       \s
             """, ingredientsText);
     }
 
@@ -160,23 +239,23 @@ public class ChatGPTService {
 
     private IngredientAnalysisResult createFallbackAnalysis(String ingredientsText) {
         IngredientAnalysisResult result = new IngredientAnalysisResult();
-        
+
         // Create a basic analysis when ChatGPT is unavailable
         List<String> ingredients = Arrays.asList(ingredientsText.split(","));
         List<IngredientAnalysisResult.IngredientDetail> ingredientDetails = ingredients.stream()
-            .map(ingredient -> {
-                IngredientAnalysisResult.IngredientDetail detail = new IngredientAnalysisResult.IngredientDetail();
-                detail.setName(ingredient.trim());
-                detail.setClassification("Neutral");
-                detail.setReason("Unable to analyze - ChatGPT service unavailable");
-                return detail;
-            })
-            .toList();
-        
+                .map(ingredient -> {
+                    IngredientAnalysisResult.IngredientDetail detail = new IngredientAnalysisResult.IngredientDetail();
+                    detail.setName(ingredient.trim());
+                    detail.setClassification("Neutral");
+                    detail.setReason("Unable to analyze - ChatGPT service unavailable");
+                    return detail;
+                })
+                .toList();
+
         result.setIngredients(ingredientDetails);
         result.setOverall_rating(5);
         result.setSummary("Analysis unavailable due to service error. Please try again later.");
-        
+
         return result;
     }
 }
